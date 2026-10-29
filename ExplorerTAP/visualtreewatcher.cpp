@@ -42,35 +42,60 @@ HRESULT VisualTreeWatcher::OnVisualTreeChange(ParentChildRelation relation, Visu
 		}
 		else if (type_view == L"Taskbar.TaskbarFrame")
 		{
-			// assume it goes DesktopWindowXamlSource -> RootGrid -> TaskbarFrame.
-			// we need RootGrid's pointer to find the right source based on its contents.
-			const auto rootGrid = FromHandle<wux::UIElement>(relation.Parent);
+			// On build 29695+ the taskbar nests the frame deeper:
+			//   DesktopWindowXamlSource -> PopupRoot -> RootScrollViewer -> ... -> Border -> TaskbarFrame
+			// The old assumption (source content == TaskbarFrame's parent) never matches anymore,
+			// so the taskbar was never registered and TranslucentTB silently did nothing.
+			// Match the source by XamlRoot identity instead.
+			wux::XamlRoot frameRoot = nullptr;
+			try
+			{
+				frameRoot = FromHandle<wux::FrameworkElement>(element.Handle).XamlRoot();
+			}
+			catch (...)
+			{
+				frameRoot = nullptr;
+			}
 
+			InstanceHandle matchedSource = 0;
 			for (auto it = m_NonMatchingXamlSources.begin(); it != m_NonMatchingXamlSources.end(); ++it)
 			{
 				const auto xamlSource = FromHandle<wuxh::DesktopWindowXamlSource>(*it);
-				wux::UIElement content = nullptr;
+				bool sameRoot = false;
 				try
 				{
-					content = xamlSource.Content();
+					const auto content = xamlSource.Content();
+					const auto contentFe = content.try_as<wux::FrameworkElement>();
+					sameRoot = frameRoot && contentFe && contentFe.XamlRoot() == frameRoot;
 				}
-				catch (const winrt::hresult_wrong_thread&)
+				catch (...)
 				{
-					continue;
+					sameRoot = false;
 				}
 
-				if (content == rootGrid)
+				if (sameRoot)
 				{
-					const auto nativeSource = xamlSource.as<IDesktopWindowXamlSourceNative>();
-
-					HWND hwnd = nullptr;
-					winrt::check_hresult(nativeSource->get_WindowHandle(&hwnd));
-
-					m_AppearanceService->RegisterTaskbar(element.Handle, hwnd);
-					m_NonMatchingXamlSources.erase(it);
-
+					matchedSource = *it;
 					break;
 				}
+			}
+
+			// fallback: XamlRoot comparison inconclusive -> use the first pending source
+			if (!matchedSource && !m_NonMatchingXamlSources.empty())
+			{
+				matchedSource = *m_NonMatchingXamlSources.begin();
+			}
+
+			if (matchedSource)
+			{
+				const auto xamlSource = FromHandle<wuxh::DesktopWindowXamlSource>(matchedSource);
+				const auto nativeSource = xamlSource.as<IDesktopWindowXamlSourceNative>();
+
+				HWND hwnd = nullptr;
+				winrt::check_hresult(nativeSource->get_WindowHandle(&hwnd));
+
+				m_AppearanceService->RegisterTaskbar(element.Handle, hwnd);
+				m_NonMatchingXamlSources.erase(matchedSource);
 			}
 		}
 		else if (type_view == winrt::name_of<wux::Shapes::Rectangle>())
